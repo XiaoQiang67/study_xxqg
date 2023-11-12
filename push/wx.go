@@ -38,6 +38,8 @@ const (
 	getOpenID   = "get_open_id"
 
 	useRequest = "use_request"
+	
+	FINISH_STATUS = "finish_status"
 )
 
 type WechatHandler func(id string, msg string)
@@ -82,6 +84,9 @@ func initWechat() {
 	RegisterHandler("通过", handleTextPass)
 	RegisterHandler("拒绝", handleTextReject)
 	RegisterHandler("使用用户列表", handleTextUserList)
+
+	// 在initWechat()函数中注册新的显示完成情况的handler
+	RegisterHandler(FINISH_STATUS, handleFinishStatus)
 
 	// 发送”/remark test即可添加备注信息”
 	RegisterHandler("/remark", handleTextRemark)
@@ -265,6 +270,97 @@ func handleTextPass(id, msg string) {
 	sendMsg(id, fmt.Sprintf("已允许用户(%v)%v使用", user.Remark, user.OpenId))
 }
 
+// handleFinishStatus函数，处理完成情况的点击事件
+func handleFinishStatus(id string, msg string) {
+	users, err := model.Query()
+	invalidUsers, _ := model.QueryFailUser()
+	if err != nil {
+		log.Errorln("查询用户出错:", err)
+		return
+	}
+
+	type ScoreResult struct {
+		Score  int
+		Err    error
+		UserNick  string
+	}
+
+
+	// 定义一个获得积分的通道 Define a channel to send and receive score results.
+	scoreChan := make(chan ScoreResult, len(users))
+
+	// 控制goroutines并发数 Define the maximum number of workers (goroutines).
+	maxWorkers := 10 // Adjust this value based on your system's capabilities.
+
+	// Create a worker pool using a buffered channel.
+	workerPool := make(chan struct{}, maxWorkers)
+
+	var wg sync.WaitGroup
+
+	for _, user := range users {
+		wg.Add(1)
+
+		go func(user *model.User) {
+			defer wg.Done()
+			workerPool <- struct{}{} // Acquire a worker slot.
+
+			score, err := lib.GetUserScore(user.ToCookies())
+			if err != nil {
+				log.Errorln("获取积分出错:", err)
+				scoreChan <- ScoreResult{Err: err}
+				<-workerPool // Release the worker slot.
+				return
+			}
+
+			scoreChan <- ScoreResult{Score:score.TotalScore,UserNick:user.Nick}
+			<-workerPool // Release the worker slot.
+		}(user)
+	}
+
+	go func() {
+		wg.Wait()
+		close(scoreChan)
+	}()
+
+	var finished int
+	var unfinished int
+
+	
+
+	for result := range scoreChan {
+		if result.Err != nil {
+			// 错误处理
+			log.Errorln("获得当日积分错误:" + result.Err.Error())
+			continue
+		}
+
+		if result.Score >= 30 {
+			finished++
+		} else {
+			unfinished++
+		}
+	}
+	
+
+	msg = fmt.Sprintf("已经完成%d人,未完成%d人", finished, unfinished)
+	
+	if len(invalidUsers) == 0 {
+		msg += ",登录失效用户:无"
+	} else {
+		// 格式化无效用户名字
+		var invalidUserNames []string
+		for _, user := range invalidUsers {
+			invalidUserNames = append(invalidUserNames, user.Nick) 
+		}
+		// 拼接消息
+		msg += fmt.Sprintf(",登录失效%d人", len(invalidUsers))
+		msg += fmt.Sprintf(",登录失效用户:%v", strings.Join(invalidUserNames, ","))
+	}
+
+	sendMsg(id, msg)
+}
+
+
 // handleEventUseRequest
 /* @Description: 处理申请使用的点击事件
 *  @param id
@@ -444,7 +540,12 @@ func sendMsg(id, message string) {
 					"value": message,
 				},
 			}
-			data, _ := json.Marshal(m)
+			data, err := json.Marshal(m)
+			if err != nil {
+			log.Errorln("JSON序列化错误:", err)
+			} else {
+			log.Infoln("data值为:", string(data))
+			}
 
 			_, err = wx.SendTemplateMessage(&mp.TemplateMessage{
 				ToUser:      user,
@@ -483,13 +584,20 @@ func sendMsg(id, message string) {
 	if err != nil {
 		log.Errorln("发送客服消息错误" + err.Error())
 		log.Warningln("开始尝试使用模板消息发送")
+		
 		m := map[string]interface{}{
 			"data": map[string]string{
-				"value": message,
+				"value": strings.ReplaceAll(message, "\n", " "),
 			},
 		}
-		data, _ := json.Marshal(m)
-
+		
+		data, err := json.Marshal(m)
+		if err != nil {
+			log.Errorln("JSON序列化错误:", err)
+		} else {
+			log.Infoln("data值为:", string(data))
+		}
+		
 		_, err = wx.SendTemplateMessage(&mp.TemplateMessage{
 			ToUser:      id,
 			TemplateId:  conf.GetConfig().Wechat.NormalTempID,
@@ -497,11 +605,14 @@ func sendMsg(id, message string) {
 			TopColor:    "",
 			RawJSONData: data,
 		})
+		
 		if err != nil {
 			return
 		}
+		
 		return
 	}
+	
 
 }
 
@@ -553,7 +664,7 @@ func handleStartStudy(id string, msg string) {
 	}
 	if users == nil {
 		log.Warningln("还未存在绑定的用户登录")
-		sendMsg(id, "你还没有已登陆的用户，请点击下方登录按钮登录！")
+		sendMsg(id, "你无登陆用户，点下方登录按钮登录！")
 		return
 	}
 	core := &lib.Core{ShowBrowser: conf.GetConfig().ShowBrowser, Push: func(id1 string, kind, msg string) {
@@ -590,7 +701,7 @@ func handleGetUser(id string, msg string) {
 	}
 	if users == nil {
 		log.Warningln("还未存在绑定的用户登录")
-		sendMsg(id, "你还没有已登陆的用户，请点击下方登录按钮登录！")
+		sendMsg(id, "你无登陆用户，点下方登录按钮登录！")
 		return
 	}
 	message := ""
@@ -601,16 +712,18 @@ func handleGetUser(id string, msg string) {
 			if user.PushId == id {
 				message += "(已绑定)\r\n"
 			}
+				message += "\n"
 		} else {
 			if user.PushId == id {
-				message += fmt.Sprintf("%v ==>  %v", user.Nick, time.Unix(user.LoginTime, 0).Format("2006-01-02"))
+				message += fmt.Sprintf("%v ==>  %v\n", user.Nick, time.Unix(user.LoginTime, 0).Format("2006-01-02"))
+				message += "\n"
 			}
 		}
-
+		
 	}
 	if message == "" {
 		log.Warningln("还未存在绑定的用户登录")
-		sendMsg(id, "你还没有已登陆的用户，请点击下方登录按钮登录！")
+		sendMsg(id, "你无登陆用户，点下方登录按钮登录！")
 		return
 	}
 	sendMsg(id, message)
@@ -623,7 +736,7 @@ func handleScore(id string, msg string) {
 	}
 	if users == nil {
 		log.Warningln("还未存在绑定的用户登录")
-		sendMsg(id, "你还没有已登陆的用户，请点击下方登录按钮登录！")
+		sendMsg(id, "你无登陆用户，点下方登录按钮登录！")
 		return
 	}
 	config := conf.GetConfig()
@@ -671,6 +784,11 @@ var (
 					Name: "积分查询",
 					Type: "click",
 					Key:  SCORE,
+				},
+				{
+					Name: "完成情况",
+          			Type: "click",
+           			Key: FINISH_STATUS,
 				},
 			},
 		},
